@@ -1,5 +1,6 @@
 import os
 import logging
+import signal
 
 from common import middleware, message_protocol, fruit_item
 
@@ -23,14 +24,20 @@ class JoinFilter:
             MOM_HOST, OUTPUT_QUEUE
         )
 
-    def process_messsage(self, message, ack, nack):
-        logging.info("Received top")
-        fruit_top = message_protocol.internal.deserialize(message)
-        self.output_queue.send(message_protocol.internal.serialize(fruit_top))
+        signal.signal(signal.SIGTERM, self._handle_sigterm)
+
+    def _handle_sigterm(self, signum, frame):
+        logging.info("Received SIGTERM")
+        self.input_queue.stop_consuming()
+
+    def process_message(self, message, ack, nack):
+        client_id, fruit_top = message_protocol.internal.deserialize(message)
+        logging.info(f"Received top for client {client_id}")
+        self.output_queue.send(message_protocol.internal.serialize(client_id, fruit_top))
         ack()
 
     def start(self):
-        self.input_queue.start_consuming(self.process_messsage)
+        self.input_queue.start_consuming(self.process_message)
 
 
 def main():
