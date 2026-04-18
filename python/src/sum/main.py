@@ -1,3 +1,4 @@
+import hashlib
 import os
 import logging
 import signal
@@ -59,6 +60,9 @@ class SumFilter:
                 self.locks[client_id] = threading.Lock()
             return self.locks[client_id]
 
+    def _get_aggregator_id(self, fruit):
+        return int(hashlib.md5(fruit.encode()).hexdigest(), 16) % AGGREGATION_AMOUNT
+
     def _process_data(self, client_id, fruit, amount):
         with self._get_lock(client_id):
             logging.info(f"Process data")
@@ -75,12 +79,12 @@ class SumFilter:
             client_state = self.amount_by_fruit.pop(client_id, {})
 
         for final_fruit_item in client_state.values():
-            for exchange in self.data_output_exchanges:
-                exchange.send(
-                    message_protocol.internal.serialize(
-                        client_id, [final_fruit_item.fruit, final_fruit_item.amount]
-                    )
+            aggregator_id = self._get_aggregator_id(final_fruit_item.fruit)
+            self.data_output_exchanges[aggregator_id].send(
+                message_protocol.internal.serialize(
+                    client_id, [final_fruit_item.fruit, final_fruit_item.amount]
                 )
+            )
 
         logging.info(f"Broadcasting EOF message")
         for exchange in self.data_output_exchanges:

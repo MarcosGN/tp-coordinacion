@@ -2,15 +2,12 @@ import os
 import logging
 import signal
 
-from common import middleware, message_protocol, fruit_item
+from common import middleware, message_protocol
 
 MOM_HOST = os.environ["MOM_HOST"]
 INPUT_QUEUE = os.environ["INPUT_QUEUE"]
 OUTPUT_QUEUE = os.environ["OUTPUT_QUEUE"]
-SUM_AMOUNT = int(os.environ["SUM_AMOUNT"])
-SUM_PREFIX = os.environ["SUM_PREFIX"]
 AGGREGATION_AMOUNT = int(os.environ["AGGREGATION_AMOUNT"])
-AGGREGATION_PREFIX = os.environ["AGGREGATION_PREFIX"]
 TOP_SIZE = int(os.environ["TOP_SIZE"])
 
 
@@ -23,6 +20,8 @@ class JoinFilter:
         self.output_queue = middleware.MessageMiddlewareQueueRabbitMQ(
             MOM_HOST, OUTPUT_QUEUE
         )
+        self.partial_tops = {}   # client_id -> [[fruit, amount], ...]
+        self.top_counts = {}     # client_id -> int (tops parciales recibidos)
 
         signal.signal(signal.SIGTERM, self._handle_sigterm)
 
@@ -30,21 +29,43 @@ class JoinFilter:
         logging.info("Received SIGTERM")
         self.input_queue.stop_consuming()
 
-    def process_message(self, message, ack, nack):
-        client_id, fruit_top = message_protocol.internal.deserialize(message)
-        logging.info(f"Received top for client {client_id}")
-        self.output_queue.send(message_protocol.internal.serialize(client_id, fruit_top))
+    def _merge_tops(self, client_id):
+        # Junta todos los tops parciales, ordena y toma el top N global
+        all_items = self.partial_tops.pop(client_id, [])
+        all_items.sort(key=lambda x: x[1], reverse=True)
+        return all_items[:TOP_SIZE]
+
+    def _process_message(self, message, ack, nack):
+        client_id, partial_top = message_protocol.internal.deserialize(message)
+
+        # Acumula los items del top parcial
+        if client_id not in self.partial_tops:
+            self.partial_tops[client_id] = []
+        self.partial_tops[client_id].extend(partial_top)
+
+        self.top_counts[client_id] = self.top_counts.get(client_id, 0) + 1
+        logging.info(f"Received partial top {self.top_counts[client_id]}/{AGGREGATION_AMOUNT} for client {client_id}")
+
+        if self.top_counts[client_id] < AGGREGATION_AMOUNT:
+            ack()
+            return
+
+        del self.top_counts[client_id]
+        final_top = self._merge_tops(client_id)
+        logging.info(f"Sending final top for client {client_id}: {final_top}")
+        self.output_queue.send(
+            message_protocol.internal.serialize(client_id, final_top)
+        )
         ack()
 
     def start(self):
-        self.input_queue.start_consuming(self.process_message)
+        self.input_queue.start_consuming(self._process_message)
 
 
 def main():
     logging.basicConfig(level=logging.INFO)
     join_filter = JoinFilter()
     join_filter.start()
-
     return 0
 
 
