@@ -25,6 +25,7 @@ class AggregationFilter:
             MOM_HOST, OUTPUT_QUEUE
         )
         self.fruit_tops = {}
+        self.eof_counts = {}
 
         signal.signal(signal.SIGTERM, self._handle_sigterm)
 
@@ -40,26 +41,27 @@ class AggregationFilter:
         fruit_top = self.fruit_tops[client_id]
         for i in range(len(fruit_top)):
             if fruit_top[i].fruit == fruit:
-                fruit_top[i] = fruit_top[i] + fruit_item.FruitItem(
-                    fruit, amount
-                )
+                updated = fruit_top[i] + fruit_item.FruitItem(fruit, amount)
+                fruit_top.pop(i)
+                bisect.insort(fruit_top, updated)
                 return
         bisect.insort(fruit_top, fruit_item.FruitItem(fruit, amount))
 
     def _process_eof(self, client_id):
-        logging.info(f"EOF received for client {client_id}")
-        top = self.fruit_tops.pop(client_id, [])
+        self.eof_counts[client_id] = self.eof_counts.get(client_id, 0) + 1
+        logging.info(f"EOF {self.eof_counts[client_id]}/{SUM_AMOUNT} for client {client_id}")
 
+        if self.eof_counts[client_id] < SUM_AMOUNT:
+            return
+
+        del self.eof_counts[client_id]
+        top = self.fruit_tops.pop(client_id, [])
         fruit_chunk = list(top[-TOP_SIZE:])
         fruit_chunk.reverse()
-        fruit_top = list(
-            map(
-                lambda fruit_item: (fruit_item.fruit, fruit_item.amount),
-                fruit_chunk,
-            )
+        partial_top = [(fi.fruit, fi.amount) for fi in fruit_chunk]
+        self.output_queue.send(
+            message_protocol.internal.serialize(client_id, partial_top)
         )
-
-        self.output_queue.send(message_protocol.internal.serialize(client_id, fruit_top))
 
     def process_messsage(self, message, ack, nack):
         logging.info("Process message")
