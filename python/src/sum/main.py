@@ -3,6 +3,7 @@ import os
 import logging
 import signal
 import threading
+import time
 
 from common import middleware, message_protocol, fruit_item
 
@@ -11,11 +12,11 @@ MOM_HOST = os.environ["MOM_HOST"]
 INPUT_QUEUE = os.environ["INPUT_QUEUE"]
 SUM_AMOUNT = int(os.environ["SUM_AMOUNT"])
 SUM_PREFIX = os.environ["SUM_PREFIX"]
-SUM_CONTROL_EXCHANGE = "SUM_CONTROL_EXCHANGE"
 AGGREGATION_AMOUNT = int(os.environ["AGGREGATION_AMOUNT"])
 AGGREGATION_PREFIX = os.environ["AGGREGATION_PREFIX"]
 
 SUM_EOF_EXCHANGE = f"{SUM_PREFIX}_eof_exchange"
+RETRY_INTERVAL = 0.5
 
 class SumFilter:
     def __init__(self):
@@ -31,6 +32,9 @@ class SumFilter:
         self.eof_output_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
             MOM_HOST, SUM_EOF_EXCHANGE, all_eof_routing_keys
         )
+        self.eof_response_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
+            MOM_HOST, SUM_EOF_EXCHANGE, all_eof_routing_keys
+        )
 
         self.data_output_exchanges = []
         for i in range(AGGREGATION_AMOUNT):
@@ -40,19 +44,22 @@ class SumFilter:
                 )
             )
 
-        self.amount_by_fruit = {}
+        self.amount_by_fruit = {} 
+        self.processed_counts = {}   
+        # client_id -> {total, responses: [int], event: threading.Event}
+        self.coordinations = {}
 
         self.locks = {} 
         self.locks_lock = threading.Lock()
+        self.eof_output_lock = threading.Lock()
         self._stop_event = threading.Event()
 
         signal.signal(signal.SIGTERM, self._handle_sigterm)
 
     def _handle_sigterm(self, signum, frame):
         logging.info("Received SIGTERM")
-        self.input_queue.stop_consuming()
-        self.eof_input_exchange.stop_consuming()
         self._stop_event.set()
+        self.input_queue.stop_consuming() 
 
     def _get_lock(self, client_id):
         with self.locks_lock:
@@ -68,15 +75,17 @@ class SumFilter:
             logging.info(f"Process data")
             if client_id not in self.amount_by_fruit:
                 self.amount_by_fruit[client_id] = {}
-            client_state = self.amount_by_fruit[client_id]
-            client_state[fruit] = client_state.get(
+                self.processed_counts[client_id] = 0
+            self.amount_by_fruit[client_id][fruit] = self.amount_by_fruit[client_id].get(
                 fruit, fruit_item.FruitItem(fruit, 0)
             ) + fruit_item.FruitItem(fruit, int(amount))
+            self.processed_counts[client_id] += 1
 
     def _send_results_to_aggregator(self, client_id):
         logging.info(f"Sending results for client {client_id} to aggregator")
         with self._get_lock(client_id):
             client_state = self.amount_by_fruit.pop(client_id, {})
+            self.processed_counts.pop(client_id, None)
 
         for final_fruit_item in client_state.values():
             aggregator_id = self._get_aggregator_id(final_fruit_item.fruit)
@@ -90,34 +99,100 @@ class SumFilter:
         for exchange in self.data_output_exchanges:
             exchange.send(message_protocol.internal.serialize(client_id, []))
 
-    def _process_eof_message(self, message, ack, nack):
-        client_id, _ = message_protocol.internal.deserialize(message)
-        logging.info(f"Got EOF from exchange for client {client_id}, sending results")
-        self._send_results_to_aggregator(client_id)
+    def _coordinate_eof(self, client_id, total_messages):
+        logging.info(f"Starting coordination for client {client_id}, total={total_messages}")
+
+        while True:
+            event = threading.Event()
+            with self.locks_lock:
+                self.coordinations[client_id] = {
+                    "total": total_messages,
+                    "responses": [],
+                    "event": event,
+                }
+
+            with self.eof_output_lock:
+                self.eof_output_exchange.send(
+                    message_protocol.internal.serialize(client_id, [total_messages])
+                )
+
+            # Espera hasta tener SUM_AMOUNT respuestas o timeout
+            event.wait(timeout=RETRY_INTERVAL)
+
+            with self.locks_lock:
+                responses = self.coordinations[client_id]["responses"]
+                total_processed = sum(responses)
+                got_all_responses = len(responses) == SUM_AMOUNT
+
+            if got_all_responses and total_processed == total_messages:
+                logging.info(f"All {total_messages} messages confirmed for client {client_id}, sending EOF_CONFIRMED")
+                with self.eof_output_lock:
+                    self.eof_output_exchange.send(
+                        message_protocol.internal.serialize(client_id, [])
+                    )
+                with self.locks_lock:
+                    del self.coordinations[client_id]
+                return
+            else:
+                logging.info(f"Not ready yet for client {client_id}: got {total_processed}/{total_messages}, retrying...")
+                time.sleep(RETRY_INTERVAL)
+
+
+    def _process_eof_exchange_message(self, message, ack, nack):
+        client_id, payload = message_protocol.internal.deserialize(message)
+
+        if len(payload) == 1:
+            with self._get_lock(client_id):
+                my_count = self.processed_counts.get(client_id, 0)
+            logging.info(f"EOF_RECEIVED for client {client_id}, I processed {my_count}, responding")
+            self.eof_response_exchange.send(
+                message_protocol.internal.serialize(client_id, [my_count, ID])
+            )
+        elif len(payload) == 2:
+            my_count, sender_id = payload
+            with self.locks_lock:
+                if client_id in self.coordinations:
+                    self.coordinations[client_id]["responses"].append(my_count)
+                    if len(self.coordinations[client_id]["responses"]) == SUM_AMOUNT:
+                        self.coordinations[client_id]["event"].set()
+        elif len(payload) == 0:
+            logging.info(f"EOF_CONFIRMED for client {client_id}, sending results")
+            self._send_results_to_aggregator(client_id)
         ack()
 
     def _process_data_message(self, message, ack, nack):
         client_id, payload = message_protocol.internal.deserialize(message)
         if len(payload) == 2:
             self._process_data(client_id, *payload)
-        else:
-            logging.info(f"Got EOF from data queue for client {client_id}, broadcasting")
-            self.eof_output_exchange.send(
-                message_protocol.internal.serialize(client_id, [])
-            )
+        elif len(payload) == 1:
+            total_messages = payload[0]
+            logging.info(f"Got EOF from gateway for client {client_id}, total={total_messages}, starting coordination")
+            threading.Thread(
+                target=self._coordinate_eof,
+                args=(client_id, total_messages),
+                daemon=True
+            ).start()
         ack()
 
     def start(self):
         eof_thread = threading.Thread(
             target=self.eof_input_exchange.start_consuming,
-            args=(self._process_eof_message,),
+            args=(self._process_eof_exchange_message,),
             daemon=True
         )
         eof_thread.start()
-        self.input_queue.start_consuming(self._process_data_message)
-
-        self._stop_event.set()
-        eof_thread.join(timeout=5)
+        try:
+            self.input_queue.start_consuming(self._process_data_message)
+        finally:
+            self._stop_event.set()
+            
+            self.eof_output_exchange.close()
+            self.eof_response_exchange.close()
+            for exchange in self.data_output_exchanges:
+                exchange.close()
+            self.input_queue.close()
+            
+            eof_thread.join(timeout=5)
 
 def main():
     logging.basicConfig(level=logging.INFO)
