@@ -76,8 +76,6 @@ Cada instancia de Sum corre con tres threads:
 
 Dado que Python tiene el GIL (*Global Interpreter Lock*), solo un thread ejecuta bytecode Python en un momento dado. Sin embargo, el GIL se libera durante operaciones de I/O bloqueantes, que es exactamente el caso de todos estos threads: pasan la mayor parte del tiempo esperando mensajes de RabbitMQ o durmiendo entre reintentos. En este escenario los threads son la solución correcta, ya que el cuello de botella es I/O y no CPU, y el GIL no penaliza el paralelismo real del sistema.
 
-Usar procesos en lugar de threads sería innecesariamente complejo: el estado compartido entre el hilo coordinador y el hilo principal (`amount_by_fruit`, `processed_counts`, `coordinations`) requeriría estructuras de `multiprocessing.Manager`, y las conexiones pika no son serializables para pasar entre procesos.
-
 ---
 
 # Trabajo Práctico - Coordinación
